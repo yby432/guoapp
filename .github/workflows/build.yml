@@ -112,7 +112,7 @@ jobs:
             printf '%s\n' "$output"
             if ! printf '%s' "$output" | tr -d ':' | tr '[:upper:]' '[:lower:]' | grep -q "$expected"; then
               echo "::warning::签名证书与发布证书不一致（fork 预览版使用 debug 签名），继续构建。" >&2
-        true
+            true
                 fi
                 done
       - name: Remove signing files
