@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,24 +15,54 @@ func (downloader *Downloader) resolveHongguoAppMedia(ctx context.Context, videoI
 	if !hongguoNumericID.MatchString(videoID) {
 		return providerMedia{}, errors.New("红果视频 ID 无效")
 	}
-	payload := map[string]any{
-		"video_id": videoID, "content_type": 1,
-		"biz_param": map[string]any{"need_all_video_definition": true, "video_platform": 3},
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			downloader.resetHongguoDevice()
+		}
+		result, err := downloader.hongguoPlaybackRequest(ctx, videoID)
+		if err != nil {
+			if errors.Is(err, errHongguoPlaybackEmpty) {
+				lastErr = err
+				continue
+			}
+			return providerMedia{}, err
+		}
+		model, err := hongguoPlaybackModel(result, videoID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return selectHongguoAppMedia(model)
 	}
-	result, err := downloader.hongguoAppRequest(ctx, http.MethodPost, "/novel/player/video_model/v1/", nil, payload)
-	if err != nil {
-		return providerMedia{}, err
-	}
+	return providerMedia{}, lastErr
+}
+
+func hongguoPlaybackModel(result map[string]any, videoID string) (map[string]any, error) {
 	data := nestedMap(result, "data")
-	model, _ := data["video_model"].(map[string]any)
-	if encoded, ok := data["video_model"].(string); ok {
+	entry := data
+	if group, ok := data["1004"].(map[string]any); ok {
+		entry = group
+	}
+	if _, ok := entry["video_model"]; !ok {
+		row, ok := entry[videoID].(map[string]any)
+		if !ok {
+			return nil, errHongguoPlaybackEmpty
+		}
+		entry = row
+	}
+	model, _ := entry["video_model"].(map[string]any)
+	if encoded, ok := entry["video_model"].(string); ok {
 		decoder := json.NewDecoder(strings.NewReader(encoded))
 		decoder.UseNumber()
 		if err := decoder.Decode(&model); err != nil {
-			return providerMedia{}, errors.New("红果 App 播放信息格式异常")
+			return nil, errors.New("红果 App 播放信息格式异常")
 		}
 	}
-	return selectHongguoAppMedia(model)
+	if len(model) == 0 {
+		return nil, errHongguoPlaybackEmpty
+	}
+	return model, nil
 }
 
 func selectHongguoAppMedia(model map[string]any) (providerMedia, error) {

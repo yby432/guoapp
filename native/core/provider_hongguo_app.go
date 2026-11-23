@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,17 @@ import (
 
 const hongguoAppBaseURL = "https://api5-normal-sinfonlineb.fqnovel.com"
 
+const hongguoPlaybackBaseURL = "https://api5-normal-sinfonlinea.fqnovel.com"
+
+const hongguoPlaybackVersionCode = "74332"
+
+const hongguoPlaybackVersionName = "7.4.3.32"
+
 const hongguoAppUserAgent = "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
+
+const hongguoPlaybackUserAgent = "com.phoenix.read/74332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:8d40f833 2026-03-03 QuicVersion:21ac1950 2025-11-18)"
+
+var errHongguoPlaybackEmpty = errors.New("红果 App 未返回该集的播放信息")
 
 type hongguoCatalogCursor struct {
 	Offset        int       `json:"offset"`
@@ -234,4 +245,126 @@ func (downloader *Downloader) hongguoAppRequest(ctx context.Context, method, pat
 		return result, nil
 	}
 	return nil, lastErr
+}
+
+func hongguoPlaybackBody(videoID string) ([]byte, error) {
+	payload := map[string]any{
+		"biz_param": map[string]any{
+			"detail_page_version": 0, "device_level": 1, "disable_digg_stat": false,
+			"disable_video_relate_book": false, "need_all_video_definition": true,
+			"need_mp4_align": false, "use_os_player": false, "use_server_dns": false, "video_platform": 1024,
+		},
+		"mixed_video_id_map": map[string][]string{"1004": {videoID}},
+		"dr_scene":           "player",
+	}
+	plain, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	var buffer bytes.Buffer
+	writer := gzip.NewWriter(&buffer)
+	if _, err := writer.Write(plain); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func (downloader *Downloader) hongguoPlaybackRequest(ctx context.Context, videoID string) (map[string]any, error) {
+	client := downloader.hongguoClient()
+	client.mu.Lock()
+	deviceID, installID := client.state.DeviceID, client.state.InstallID
+	client.mu.Unlock()
+	body, err := hongguoPlaybackBody(videoID)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{
+		"aid": {"8662"}, "app_name": {"novelread"}, "version_code": {hongguoPlaybackVersionCode}, "version_name": {hongguoPlaybackVersionName},
+		"manifest_version_code": {hongguoPlaybackVersionCode}, "update_version_code": {hongguoPlaybackVersionCode}, "channel": {"update_64"},
+		"device_platform": {"android"}, "os": {"android"}, "ssmix": {"a"}, "device_type": {"25053RT47C"},
+		"device_brand": {"Redmi"}, "language": {"zh"}, "os_api": {"36"}, "os_version": {"16"},
+		"resolution": {"1280*2772"}, "dpi": {"520"}, "ac": {"wifi"}, "device_id": {deviceID}, "iid": {installID},
+		"host_abi": {"arm64-v8a"}, "dragon_device_type": {"phone"}, "pv_player": {hongguoPlaybackVersionCode},
+		"compliance_status": {"0"}, "need_personal_recommend": {"1"}, "player_so_load": {"1"}, "is_android_pad_screen": {"0"},
+	}
+	attempts := downloader.cfg.Retries
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > 3 {
+		attempts = 3
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, hongguoPlaybackBaseURL+"/novel/player/multi_video_model/player/v1", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("User-Agent", hongguoPlaybackUserAgent)
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("X-XS-From-Web", "0")
+		request.Header.Set("Sdk-Version", "2")
+		request.Header.Set("Content-Type", "application/json; charset=utf-8")
+		request.Header.Set("Content-Encoding", "gzip")
+		response, err := downloader.doPreparedCatalogRequest(request, 20*time.Second, func(prepared *http.Request) {
+			now := time.Now()
+			query.Set("_rticket", strconv.FormatInt(now.UnixMilli(), 10))
+			prepared.URL.RawQuery = query.Encode()
+			signHongguoRequest(prepared, body, now)
+		})
+		if err != nil {
+			lastErr = err
+			var backoff *requestBackoff
+			if errors.As(err, &backoff) || ctx.Err() != nil {
+				return nil, err
+			}
+			continue
+		}
+		content, readErr := io.ReadAll(io.LimitReader(response.Body, providerMaxBodyBytes+1))
+		response.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if response.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("红果 App 接口 HTTP %d", response.StatusCode)
+			if response.StatusCode >= 400 && response.StatusCode < 500 {
+				return nil, lastErr
+			}
+			continue
+		}
+		if len(content) == 0 || len(content) > providerMaxBodyBytes {
+			return nil, errHongguoPlaybackEmpty
+		}
+		var result map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(content))
+		decoder.UseNumber()
+		if err := decoder.Decode(&result); err != nil || result == nil {
+			return nil, errors.New("红果 App 接口返回格式异常")
+		}
+		code := firstNonEmpty(mapString(result, "code", "Code", "status_code"), mapString(nestedMap(result, "BaseResp"), "StatusCode"))
+		if code != "" && code != "0" {
+			return nil, fmt.Errorf("红果 App 接口暂不可用（%s）", truncate(code, 20))
+		}
+		return result, nil
+	}
+	return nil, lastErr
+}
+
+func (downloader *Downloader) resetHongguoDevice() {
+	client := downloader.hongguoClient()
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.state.DeviceID = newHongguoDeviceID()
+	client.state.InstallID = newHongguoDeviceID()
 }
