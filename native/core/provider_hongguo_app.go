@@ -41,16 +41,26 @@ type hongguoCatalogCursor struct {
 }
 
 type hongguoCatalogState struct {
-	Version   int                             `json:"version"`
-	DeviceID  string                          `json:"deviceId"`
-	InstallID string                          `json:"installId"`
-	CDID      string                          `json:"cdid"`
-	Feeds     map[string]hongguoCatalogCursor `json:"feeds"`
+	Version             int                             `json:"version"`
+	DeviceID            string                          `json:"deviceId"`
+	InstallID           string                          `json:"installId"`
+	CDID                string                          `json:"cdid"`
+	OpenUDID            string                          `json:"openudid"`
+	ClientUDID          string                          `json:"clientudid"`
+	OAID                string                          `json:"oaid"`
+	ReqID               string                          `json:"reqId"`
+	RegisteredDeviceID  string                          `json:"registeredDeviceId"`
+	RegisteredInstallID string                          `json:"registeredInstallId"`
+	TTReq               string                          `json:"ttreq"`
+	StoreRegion         string                          `json:"storeRegion"`
+	StoreRegionSrc      string                          `json:"storeRegionSrc"`
+	Feeds               map[string]hongguoCatalogCursor `json:"feeds"`
 }
 
 type hongguoAppClient struct {
 	mu             sync.Mutex
 	catalogMu      sync.Mutex
+	registerMu     sync.Mutex
 	baseURL        string
 	state          hongguoCatalogState
 	details        map[string]hongguoDetailEntry
@@ -110,6 +120,25 @@ func (downloader *Downloader) restoreHongguoCatalog(state *hongguoCatalogState) 
 	if len(client.state.Feeds) == 0 {
 		if cloned.CDID == "" {
 			cloned.CDID = hongguoV5NewCDID()
+		}
+		if cloned.OpenUDID == "" {
+			cloned.OpenUDID = hongguoNewOpenUDID()
+		}
+		if cloned.ClientUDID == "" {
+			cloned.ClientUDID = hongguoV5NewCDID()
+		}
+		if cloned.OAID == "" {
+			cloned.OAID = hongguoV5NewCDID()
+		}
+		if cloned.ReqID == "" {
+			cloned.ReqID = hongguoV5NewCDID()
+		}
+		if !hongguoRegistered(*cloned) {
+			cloned.RegisteredDeviceID = ""
+			cloned.RegisteredInstallID = ""
+			cloned.TTReq = ""
+			cloned.StoreRegion = ""
+			cloned.StoreRegionSrc = ""
 		}
 		client.state = *cloned
 	}
@@ -298,8 +327,17 @@ func (downloader *Downloader) hongguoPlaybackRequest(ctx context.Context, videoI
 			}
 		}
 		client := downloader.hongguoClient()
+		if err := downloader.hongguoEnsureRegistered(ctx); err != nil {
+			lastErr = err
+			var backoff *requestBackoff
+			if errors.As(err, &backoff) || ctx.Err() != nil {
+				return nil, err
+			}
+			continue
+		}
 		client.mu.Lock()
-		deviceID, installID, cdid := client.state.DeviceID, client.state.InstallID, client.state.CDID
+		deviceID, installID, cdid := client.state.RegisteredDeviceID, client.state.RegisteredInstallID, client.state.CDID
+		cookie := hongguoGuestCookie(client.state)
 		if cdid == "" {
 			cdid = hongguoV5NewCDID()
 			client.state.CDID = cdid
@@ -321,6 +359,9 @@ func (downloader *Downloader) hongguoPlaybackRequest(ctx context.Context, videoI
 		request.Header.Set("x-ss-dp", "8662")
 		request.Header.Set("lc", "101")
 		request.Header.Set("x-reading-request", hongguoV5ReadingRequestID(now.UnixMilli()))
+		if cookie != "" {
+			request.Header.Set("Cookie", cookie)
+		}
 		response, err := downloader.doPreparedCatalogRequest(request, 20*time.Second, func(prepared *http.Request) {
 			prepared.URL.RawQuery = query
 			for key, value := range headers {
@@ -373,4 +414,13 @@ func (downloader *Downloader) resetHongguoDevice() {
 	client.state.DeviceID = newHongguoDeviceID()
 	client.state.InstallID = newHongguoDeviceID()
 	client.state.CDID = hongguoV5NewCDID()
+	client.state.OpenUDID = hongguoNewOpenUDID()
+	client.state.ClientUDID = hongguoV5NewCDID()
+	client.state.OAID = hongguoV5NewCDID()
+	client.state.ReqID = hongguoV5NewCDID()
+	client.state.RegisteredDeviceID = ""
+	client.state.RegisteredInstallID = ""
+	client.state.TTReq = ""
+	client.state.StoreRegion = ""
+	client.state.StoreRegionSrc = ""
 }
