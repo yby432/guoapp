@@ -44,6 +44,7 @@ type hongguoCatalogState struct {
 	Version   int                             `json:"version"`
 	DeviceID  string                          `json:"deviceId"`
 	InstallID string                          `json:"installId"`
+	CDID      string                          `json:"cdid"`
 	Feeds     map[string]hongguoCatalogCursor `json:"feeds"`
 }
 
@@ -66,7 +67,7 @@ func (downloader *Downloader) hongguoClient() *hongguoAppClient {
 	downloader.hongguoOnce.Do(func() {
 		downloader.hongguo = &hongguoAppClient{
 			baseURL: hongguoAppBaseURL,
-			state:   hongguoCatalogState{Version: 1, DeviceID: newHongguoDeviceID(), InstallID: newHongguoDeviceID(), Feeds: map[string]hongguoCatalogCursor{}},
+			state:   hongguoCatalogState{Version: 1, DeviceID: newHongguoDeviceID(), InstallID: newHongguoDeviceID(), CDID: hongguoV5NewCDID(), Feeds: map[string]hongguoCatalogCursor{}},
 			details: map[string]hongguoDetailEntry{}, pending: map[string]*hongguoDetailCall{},
 			searches: map[string]hongguoSearchEntry{}, searchPending: map[string]*hongguoSearchCall{},
 			suggestions: map[string]hongguoSuggestionEntry{}, suggestPending: map[string]*hongguoSuggestionCall{},
@@ -107,6 +108,9 @@ func (downloader *Downloader) restoreHongguoCatalog(state *hongguoCatalogState) 
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	if len(client.state.Feeds) == 0 {
+		if cloned.CDID == "" {
+			cloned.CDID = hongguoV5NewCDID()
+		}
 		client.state = *cloned
 	}
 }
@@ -273,22 +277,9 @@ func hongguoPlaybackBody(videoID string) ([]byte, error) {
 }
 
 func (downloader *Downloader) hongguoPlaybackRequest(ctx context.Context, videoID string) (map[string]any, error) {
-	client := downloader.hongguoClient()
-	client.mu.Lock()
-	deviceID, installID := client.state.DeviceID, client.state.InstallID
-	client.mu.Unlock()
 	body, err := hongguoPlaybackBody(videoID)
 	if err != nil {
 		return nil, err
-	}
-	query := url.Values{
-		"aid": {"8662"}, "app_name": {"novelread"}, "version_code": {hongguoPlaybackVersionCode}, "version_name": {hongguoPlaybackVersionName},
-		"manifest_version_code": {hongguoPlaybackVersionCode}, "update_version_code": {hongguoPlaybackVersionCode}, "channel": {"update_64"},
-		"device_platform": {"android"}, "os": {"android"}, "ssmix": {"a"}, "device_type": {"25053RT47C"},
-		"device_brand": {"Redmi"}, "language": {"zh"}, "os_api": {"36"}, "os_version": {"16"},
-		"resolution": {"1280*2772"}, "dpi": {"520"}, "ac": {"wifi"}, "device_id": {deviceID}, "iid": {installID},
-		"host_abi": {"arm64-v8a"}, "dragon_device_type": {"phone"}, "pv_player": {hongguoPlaybackVersionCode},
-		"compliance_status": {"0"}, "need_personal_recommend": {"1"}, "player_so_load": {"1"}, "is_android_pad_screen": {"0"},
 	}
 	attempts := downloader.cfg.Retries
 	if attempts < 1 {
@@ -306,21 +297,35 @@ func (downloader *Downloader) hongguoPlaybackRequest(ctx context.Context, videoI
 				return nil, ctx.Err()
 			}
 		}
+		client := downloader.hongguoClient()
+		client.mu.Lock()
+		deviceID, installID, cdid := client.state.DeviceID, client.state.InstallID, client.state.CDID
+		if cdid == "" {
+			cdid = hongguoV5NewCDID()
+			client.state.CDID = cdid
+		}
+		client.mu.Unlock()
+		now := time.Now()
+		query, headers, err := hongguoV5SignPlayback(hongguoV5PlaybackPairs(deviceID, installID, cdid), now.UnixMilli(), body, nil)
+		if err != nil {
+			return nil, err
+		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodPost, hongguoPlaybackBaseURL+"/novel/player/multi_video_model/player/v1", bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		request.Header.Set("User-Agent", hongguoPlaybackUserAgent)
-		request.Header.Set("Accept", "application/json")
+		request.Header.Set("Accept", "application/json; charset=utf-8,application/x-protobuf")
 		request.Header.Set("X-XS-From-Web", "0")
-		request.Header.Set("Sdk-Version", "2")
-		request.Header.Set("Content-Type", "application/json; charset=utf-8")
 		request.Header.Set("Content-Encoding", "gzip")
+		request.Header.Set("x-ss-dp", "8662")
+		request.Header.Set("lc", "101")
+		request.Header.Set("x-reading-request", hongguoV5ReadingRequestID(now.UnixMilli()))
 		response, err := downloader.doPreparedCatalogRequest(request, 20*time.Second, func(prepared *http.Request) {
-			now := time.Now()
-			query.Set("_rticket", strconv.FormatInt(now.UnixMilli(), 10))
-			prepared.URL.RawQuery = query.Encode()
-			signHongguoRequest(prepared, body, now)
+			prepared.URL.RawQuery = query
+			for key, value := range headers {
+				prepared.Header.Set(key, value)
+			}
 		})
 		if err != nil {
 			lastErr = err
@@ -367,4 +372,5 @@ func (downloader *Downloader) resetHongguoDevice() {
 	defer client.mu.Unlock()
 	client.state.DeviceID = newHongguoDeviceID()
 	client.state.InstallID = newHongguoDeviceID()
+	client.state.CDID = hongguoV5NewCDID()
 }
